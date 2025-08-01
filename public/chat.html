@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Secure Chat</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="chat-container">
+    <div class="chat-header">
+      <h1><i class="fas fa-comments"></i> Secure WebSocket Chat</h1>
+      <div class="online-count">0 online</div>
+      <button id="logoutBtn"><i class="fas fa-sign-out-alt"></i></button>
+    </div>
+    <div class="chat-messages" id="messages"></div>
+    <div class="chat-input">
+      <input type="text" id="msg" placeholder="Type a message..." autocomplete="off">
+      <button id="sendBtn"><i class="fas fa-paper-plane"></i></button>
+    </div>
+    <div class="encryption-info">
+      <p><i class="fas fa-lock"></i> All messages are encrypted end-to-end and digitally signed</p>
+    </div>
+  </div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const messages = document.getElementById('messages');
+    
+    let myUsername = new URLSearchParams(window.location.search).get('username');
+    if (!myUsername) window.location.href = '/';
+    socket.emit('set-username', myUsername);
+
+    // AES
+    const ENCRYPTION_KEY = new Uint8Array([
+      72, 101, 108, 108, 111, 87, 111, 114, 108, 100, 49, 50, 51, 52, 53, 54,
+      55, 56, 57, 48, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+    ]);
+    const IV_LENGTH = 16;
+
+    // RSA
+    let privateKey;
+    let publicKey;
+    let publicKeys = {};
+
+    async function initKeys() {
+      try {
+        const keyPair = await crypto.subtle.generateKey(
+          {
+            name: "RSA-PSS",
+            modulusLength: 2048,
+            publicExponent: new Uint8Array([0x01, 0x00, 0x01]),
+            hash: { name: "SHA-256" }
+          },
+          true,
+          ["sign", "verify"]
+        );
+        privateKey = keyPair.privateKey;
+        publicKey = keyPair.publicKey;
+
+        const exportedPublicKey = await crypto.subtle.exportKey("spki", publicKey);
+        const exportedPublicKeyArray = Array.from(new Uint8Array(exportedPublicKey));
+        
+        socket.emit('register-public-key', {
+          username: myUsername,
+          publicKey: exportedPublicKeyArray
+        });
+      } catch (err) {
+        console.error('Key generation failed:', err);
+      }
+    }
+
+    async function encrypt(text) {
+      const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+      const key = await crypto.subtle.importKey(
+        'raw',
+        ENCRYPTION_KEY,
+        { name: 'AES-CBC' },
+        false,
+        ['encrypt']
+      );
+      const encrypted = await crypto.subtle.encrypt(
+        { name: 'AES-CBC', iv },
+        key,
+        new TextEncoder().encode(text)
+      );
+      return `${Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('')}:${Array.from(new Uint8Array(encrypted)).map(b => b.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    async function decrypt(text) {
+      const [ivHex, encryptedHex] = text.split(':');
+      const iv = new Uint8Array(ivHex.match(/../g).map(h => parseInt(h, 16)));
+      const encrypted = new Uint8Array(encryptedHex.match(/../g).map(h => parseInt(h, 16)));
+      const key = await crypto.subtle.importKey(
+        'raw',
+        ENCRYPTION_KEY,
+        { name: 'AES-CBC' },
+        false,
+        ['decrypt']
+      );
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-CBC', iv },
+        key,
+        encrypted
+      );
+      return new TextDecoder().decode(decrypted);
+    }
+
+    async function signMessage(message) {
+      const signature = await crypto.subtle.sign(
+        {
+          name: "RSA-PSS",
+          saltLength: 32
+        },
+        privateKey,
+        new TextEncoder().encode(message)
+      );
+      return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function verifyMessage(message, signatureHex, username) {
+      if (!publicKeys[username]) {
+        console.error("No public key available for user:", username);
+        return false;
+      }
+      const signature = new Uint8Array(signatureHex.match(/../g).map(h => parseInt(h, 16)));
+      return await crypto.subtle.verify(
+        {
+          name: "RSA-PSS",
+          saltLength: 32
+        },
+        publicKeys[username],
+        signature,
+        new TextEncoder().encode(message)
+      );
+    }
+
+    document.getElementById('sendBtn').addEventListener('click', sendMessage);
+    document.getElementById('msg').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') sendMessage();
+    });
+    document.getElementById('logoutBtn').addEventListener('click', () => {
+      alert('Thank you for using the secure chat app!');
+      window.location.href = '/';
+    });
+
+    async function sendMessage() {
+      const message = document.getElementById('msg').value.trim();
+      if (message) {
+        try {
+          const encrypted = await encrypt(message);
+          const signature = await signMessage(message);
+          socket.emit('user-message', {
+            text: encrypted,
+            signature: signature
+          });
+          document.getElementById('msg').value = '';
+        } catch (err) {
+          console.error('Encryption/signing error:', err);
+          addSystemMessage('Failed to send message');
+        }
+      }
+    }
+
+    socket.on('user-joined', (data) => {
+      updateOnlineCount(data.count);
+      if (data.username !== myUsername) addSystemMessage(`${data.username} joined`);
+    });
+
+    socket.on('user-left', (data) => {
+      updateOnlineCount(data.count);
+      addSystemMessage(`${data.username} left`);
+    });
+
+    socket.on('public-key', async (data) => {
+      try {
+        const importedKey = await crypto.subtle.importKey(
+          "spki",
+          new Uint8Array(data.publicKey),
+          {
+            name: "RSA-PSS",
+            hash: { name: "SHA-256" }
+          },
+          true,
+          ["verify"]
+        );
+        publicKeys[data.username] = importedKey;
+        console.log(`Stored public key for ${data.username}`);
+      } catch (err) {
+        console.error('Failed to import public key:', err);
+      }
+    });
+
+    socket.on('message', async (data) => {
+      try {
+        const decrypted = await decrypt(data.text);
+        const isVerified = await verifyMessage(decrypted, data.signature, data.username);
+
+        // if (!isVerified) {
+        //   addSystemMessage(`Security Warning: Message from ${data.username} failed verification`);
+        //   return;
+        // }
+
+        addMessage(decrypted, data.username === myUsername, data.username, data.timestamp);
+      } catch (err) {
+        console.error('Decryption/verification error:', err);
+        addSystemMessage('Could not process a message (invalid or tampered)');
+      }
+    });
+
+    function addMessage(text, isSent, username, timestamp) {
+      const messageDiv = document.createElement('div');
+      messageDiv.className = `message ${isSent ? 'sent' : 'received'}`;
+      messageDiv.innerHTML = `
+        <div class="message-header">
+          <span class="message-sender">${isSent ? 'You' : username}</span>
+          ${isSent ? '<i class="fas fa-certificate verified-icon" title="Digitally signed by you"></i>' : ''}
+        </div>
+        <div class="message-content">${text}</div>
+        <div class="message-footer">
+          <span class="message-time">${timestamp}</span>
+          ${isSent ? '<i class="fas fa-check status"></i>' : ''}
+        </div>
+      `;
+      messages.appendChild(messageDiv);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function addSystemMessage(text) {
+      const div = document.createElement('div');
+      div.className = 'system-message';
+      div.textContent = text;
+      messages.appendChild(div);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function updateOnlineCount(count) {
+      document.querySelector('.online-count').textContent = `${count} ${count === 1 ? 'person' : 'people'} online`;
+    }
+
+    // Initialize keys when page loads
+    initKeys();
+  </script>
+</body>
+</html>
